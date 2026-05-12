@@ -8,13 +8,53 @@ into a validated, structured contract suitable for downstream ERP consumption.
 ## Pipeline
 
 ```
-Raw PO (PDF/IMG/XLSX/EMAIL)
+Raw PO (PDF / IMG / XLSX / EMAIL)
   → parse-po edge function (Anthropic Claude, Haiku→Sonnet confidence fallback)
+  → AI-driven SKU matching (pg_trgm pre-filter → Claude disambiguation per line)
   → ai_extractions table (normalized JSON + per-field confidence)
   → human review (cell edits → ml_feedback for ML loop)
   → render-proforma edge function (CBM enrichment + invoice HTML)
   → proforma_invoices table (checksum, sign-off gated by role)
 ```
+
+## Request formats
+
+`POST /functions/v1/parse-po`
+
+```jsonc
+// EMAIL / MANUAL
+{
+  "source_type": "EMAIL",
+  "customer_id": "BUYER_X",
+  "document_content": "PO #123 ..."
+}
+
+// PDF
+{
+  "source_type": "PDF",
+  "customer_id": "BUYER_X",
+  "file_base64": "<base64 of PDF bytes, no data: prefix>",
+  "file_mime": "application/pdf"
+}
+
+// IMAGE
+{
+  "source_type": "IMAGE",
+  "customer_id": "BUYER_X",
+  "file_base64": "<base64>",
+  "file_mime": "image/jpeg" | "image/png" | "image/webp"
+}
+
+// EXCEL — parsed to CSV text via SheetJS before LLM call
+{
+  "source_type": "EXCEL",
+  "customer_id": "BUYER_X",
+  "file_base64": "<base64>",
+  "file_mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+}
+```
+
+Max file size: 8 MB raw (Supabase request body limit is ~6 MB after base64 inflation).
 
 ## Layout
 
