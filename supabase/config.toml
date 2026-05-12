@@ -1,0 +1,27 @@
+# Supabase project config (committed; non-secret)
+# Function-level overrides for OFAEM.
+#
+# IMPORTANT: setting verify_jwt = false bypasses Supabase's default auth gate.
+# For ingest-email we want webhook providers (Mailgun, SES, etc.) to be able
+# to POST without a JWT, so we replace the JWT check with an explicit
+# X-Webhook-Secret header check inside the function body (see index.ts).
+#
+# To enable webhook auth, run:
+#   supabase secrets set INGEST_WEBHOOK_SECRET=<random-32-bytes-hex>
+# and configure your inbound mail provider to send that header.
+#
+# If INGEST_WEBHOOK_SECRET is unset, the function rejects any request that
+# doesn't carry the standard Supabase JWT (the platform still adds an outer
+# auth layer at the gateway when verify_jwt = true). With verify_jwt = false
+# AND no INGEST_WEBHOOK_SECRET set, the function will accept any request —
+# we therefore leave verify_jwt = true by default and let the operator flip
+# it deliberately when they wire up an external webhook.
+
+[functions.ingest-email]
+verify_jwt = true
+
+[functions.parse-po]
+verify_jwt = true
+
+[functions.render-proforma]
+verify_jwt = true

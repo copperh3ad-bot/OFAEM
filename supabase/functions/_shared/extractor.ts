@@ -17,7 +17,7 @@ import PostalMime from "https://esm.sh/postal-mime@2.4.3";
 import { calculateCBM, type LineItem, type MasterArticle } from "./cbm.ts";
 import { applyReadinessFlags } from "./confidence.ts";
 import { matchSKU } from "./sku_matcher.ts";
-import { detectAndApplyRevision, type RevisionResult } from "./revision_detector.ts";
+import { computePayloadDiff, type RevisionDiff } from "./revision_detector.ts";
 import {
   SYSTEM_PROMPT_PO_EXTRACTION,
   buildFewShotContext,
@@ -67,8 +67,23 @@ export interface ExtractResponse {
     is_revision: boolean;
     version_number: number;
     superseded_extraction_ids: string[];
-    diff: RevisionResult["diff"];
+    diff: RevisionDiff | null;
   };
+}
+
+// Internal fields stripped from line_items before payload persistence so they
+// never reach buyer-readable rows. (match_reasoning and _matched_master are
+// matcher debug metadata — useful in the immediate API response but should
+// not be stored or exposed via ai_extractions.payload.)
+const INTERNAL_LINE_ITEM_FIELDS = new Set(["_matched_master", "match_reasoning"]);
+function stripInternal<T extends Record<string, unknown>>(items: T[]): T[] {
+  return items.map((it) => {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(it)) {
+      if (!INTERNAL_LINE_ITEM_FIELDS.has(k)) out[k] = it[k];
+    }
+    return out as T;
+  });
 }
 
 type UserContentBlock =
@@ -366,10 +381,22 @@ async function logLowConfidenceFields(supabase: any, poId: string, sourceType: s
   for (const item of items) {
     if (!item.requires_review) continue;
     for (const reason of (item.review_reason ?? "").split(",").filter(Boolean)) {
+      // Map reason → affected_field so error_patterns trigger aggregates meaningfully
+      const affectedField =
+        reason === "low_sku_confidence"      ? "sku"      :
+        reason === "low_quantity_confidence" ? "quantity" :
+        reason === "low_unit_confidence"     ? "unit"     :
+        reason === "low_price_confidence"    ? "unit_price" :
+        reason === "estimated_dimensions"    ? "dimensions" :
+        "unknown";
       rows.push({
         message: `Line ${item.line_no} flagged: ${reason}`,
-        severity: "warning", category: "extraction",
-        context: JSON.stringify({ po_id: poId, line_no: item.line_no, source_type: sourceType, reason }),
+        severity: "warning",
+        category: "extraction",
+        affected_field: affectedField,
+        reason_code: reason,
+        source_type: sourceType,
+        context: JSON.stringify({ po_id: poId, line_no: item.line_no, reason }),
       });
     }
   }
@@ -466,44 +493,82 @@ export async function runExtraction(
     ? built.content.slice(0, 100_000)
     : `[${request.source_type} file, ${request.file_mime}, ~${decodeBase64Size(request.file_base64 ?? "")} bytes]`;
 
-  const { data: inserted, error: insertError } = await supabase
-    .from("ai_extractions")
-    .insert({
-      kind: "purchase_order",
-      customer_id: request.customer_id,
+  // Reject empty extractions — an "empty PO" is almost always a misclassified
+  // email or a failed parse, not a legitimate zero-line order.
+  if ((normalized.line_items as unknown[]).length === 0) {
+    await supabase.from("error_log").insert({
+      message: "extraction yielded zero line items",
+      severity: "warning",
+      category: "extraction",
       source_type: request.source_type,
-      raw_content: rawForDb,
-      payload: normalized,
-      model_used: modelUsed,
-      overall_confidence: extraction._confidence?.overall ?? null,
-      is_ready_for_invoicing: readiness.is_ready_for_invoicing,
-    })
-    .select("id")
-    .single();
+      context: JSON.stringify({ customer_id: request.customer_id, po_id: normalized.metadata.po_id }),
+    });
+    return { success: false, status: 422, error: "no line items extracted" };
+  }
 
-  if (insertError) return { success: false, status: 500, error: `db insert failed: ${insertError.message}` };
+  // Atomic insert + revision supersede via RPC (advisory xact lock prevents
+  // the TOCTOU race that allowed duplicate is_current_version=true rows).
+  // Internal matcher fields are stripped from the persisted payload.
+  const persistedPayload = {
+    ...normalized,
+    line_items: stripInternal(normalized.line_items as unknown as Record<string, unknown>[]),
+  };
+
+  const { data: rpcData, error: rpcError } = await supabase.rpc("upsert_extraction_versioned", {
+    p_customer_id: request.customer_id,
+    p_source_type: request.source_type,
+    p_raw_content: rawForDb,
+    p_payload: persistedPayload,
+    p_model_used: modelUsed,
+    p_overall_confidence: extraction._confidence?.overall ?? null,
+    p_is_ready_for_invoicing: readiness.is_ready_for_invoicing,
+  });
+
+  if (rpcError || !Array.isArray(rpcData) || rpcData.length === 0) {
+    return {
+      success: false, status: 500,
+      error: `db upsert failed: ${rpcError?.message ?? "no rows returned"}`,
+    };
+  }
+  const row = rpcData[0] as {
+    new_extraction_id: string;
+    assigned_version_number: number;
+    superseded_ids: string[] | null;
+    prior_payload: Record<string, unknown> | null;
+    is_revision: boolean;
+  };
+
+  // Compute diff client-side from the prior payload returned by the RPC
+  let diff: RevisionDiff | null = null;
+  if (row.is_revision && row.prior_payload) {
+    diff = computePayloadDiff(
+      {
+        id: (row.superseded_ids ?? [])[0] ?? "",
+        version_number: row.assigned_version_number - 1,
+        payload: row.prior_payload as Parameters<typeof computePayloadDiff>[0]["payload"],
+      },
+      persistedPayload as unknown as Parameters<typeof computePayloadDiff>[1],
+    );
+    // Persist the diff (non-critical UPDATE; pipeline continues if it fails)
+    await supabase
+      .from("ai_extractions")
+      .update({ revision_diff: diff })
+      .eq("id", row.new_extraction_id);
+  }
 
   await logLowConfidenceFields(supabase, normalized.metadata.po_id, request.source_type, readiness.items);
 
-  const revision = await detectAndApplyRevision(
-    supabase, inserted.id, request.customer_id, normalized.metadata.po_id,
-    {
-      metadata: normalized.metadata,
-      line_items: normalized.line_items as unknown as { sku: string; quantity: number; unit: string; unit_price: number; description?: string }[],
-    },
-  );
-
   return {
     success: true,
-    extraction_id: inserted.id,
+    extraction_id: row.new_extraction_id,
     normalized_po: normalized,
     model_used: modelUsed,
     inline_images_processed: built.inline_images_found ?? 0,
     version: {
-      is_revision: revision.is_revision,
-      version_number: revision.version_number,
-      superseded_extraction_ids: revision.superseded_ids,
-      diff: revision.diff,
+      is_revision: row.is_revision,
+      version_number: row.assigned_version_number,
+      superseded_extraction_ids: row.superseded_ids ?? [],
+      diff,
     },
   };
 }

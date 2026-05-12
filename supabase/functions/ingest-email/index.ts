@@ -25,6 +25,7 @@ import { runExtraction } from "../_shared/extractor.ts";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY") ?? "";
+const INGEST_WEBHOOK_SECRET = Deno.env.get("INGEST_WEBHOOK_SECRET") ?? "";
 
 const MAX_RAW_EMAIL_BYTES = 12 * 1024 * 1024;  // 12 MB headroom for attachments
 
@@ -140,18 +141,59 @@ async function logIngest(
   }).then(() => {}).catch(() => {});
 }
 
-function deriveCustomerId(parsed: ParsedEmail, override?: string): string {
-  if (override) return override;
-  // Default: use sender's email domain as customer_id so revision detection
-  // groups POs from the same buyer organization
-  const match = parsed.from_address.match(/@([\w.-]+)/);
-  return match ? match[1].toUpperCase() : "UNKNOWN_BUYER";
+/**
+ * Resolve sender to canonical customer_id via DB RPC.
+ *
+ * Resolution order:
+ *   1. caller-supplied override wins
+ *   2. exact email mapping in customer_email_map
+ *   3. if sender domain is in shared_email_domains → use full email (isolate)
+ *   4. domain mapping in customer_email_map
+ *   5. default: uppercased domain
+ */
+async function resolveCustomer(
+  // deno-lint-ignore no-explicit-any
+  supabase: any,
+  parsed: ParsedEmail,
+  override?: string,
+): Promise<{ customer_id: string; source: string; is_shared: boolean }> {
+  if (override) return { customer_id: override, source: "caller_override", is_shared: false };
+  const { data, error } = await supabase.rpc("resolve_customer_for_sender", {
+    p_from_address: parsed.from_address,
+  });
+  if (error || !Array.isArray(data) || data.length === 0) {
+    return { customer_id: "UNKNOWN_BUYER", source: "rpc_failed", is_shared: false };
+  }
+  const row = data[0];
+  return {
+    customer_id: row.customer_id as string,
+    source: row.resolution_source as string,
+    is_shared: row.is_shared_domain as boolean,
+  };
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
 }
 
 serve(async (req: Request): Promise<Response> => {
   const startedAt = Date.now();
   if (req.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
   if (req.method !== "POST") return json({ error: "method not allowed" }, 405);
+
+  // Webhook secret enforcement (only when env var is set; explicit opt-in).
+  // For untrusted public webhooks (SendGrid, Mailgun, etc.) set INGEST_WEBHOOK_SECRET
+  // and configure the forwarder to send the header. Until set, the function
+  // still requires the standard Supabase JWT auth.
+  if (INGEST_WEBHOOK_SECRET) {
+    const supplied = req.headers.get("x-webhook-secret") ?? "";
+    if (!constantTimeEquals(supplied, INGEST_WEBHOOK_SECRET)) {
+      return json({ error: "invalid or missing X-Webhook-Secret" }, 401);
+    }
+  }
 
   let payload: IngestRequest;
   try {
@@ -177,12 +219,15 @@ serve(async (req: Request): Promise<Response> => {
     return json({ error: `email parse failed: ${(e as Error).message}` }, 400);
   }
 
-  // Idempotency: have we seen this Message-ID before?
+  // Idempotency: have we already successfully processed this Message-ID?
+  // We skip on a prior PO or NOT_PO record but allow retry on ERROR rows so
+  // transient failures aren't permanently sticky.
   if (parsed.message_id) {
     const { data: existing } = await supabase
       .from("email_ingest_log")
       .select("id, classification, extraction_id")
       .eq("message_id", parsed.message_id)
+      .in("classification", ["PO", "NOT_PO"])
       .maybeSingle();
     if (existing) {
       return json({
@@ -196,7 +241,8 @@ serve(async (req: Request): Promise<Response> => {
     }
   }
 
-  const customerId = deriveCustomerId(parsed, payload.customer_id);
+  const resolved = await resolveCustomer(supabase, parsed, payload.customer_id);
+  const customerId = resolved.customer_id;
 
   // Classify
   const classification = await classifyEmail(anthropic, {
@@ -252,6 +298,7 @@ serve(async (req: Request): Promise<Response> => {
     confidence: classification.confidence,
     reason: classification.reason,
     customer_id: customerId,
+    customer_resolution: { source: resolved.source, is_shared_domain: resolved.is_shared },
     extraction_id: result.extraction_id,
     normalized_po: result.normalized_po,
     version: result.version,
