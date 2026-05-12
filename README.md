@@ -45,14 +45,39 @@ Raw PO (PDF / IMG / XLSX / EMAIL)
   "file_mime": "image/jpeg" | "image/png" | "image/webp"
 }
 
-// EXCEL — parsed to CSV text via SheetJS before LLM call
+// EXCEL — parsed to CSV text via SheetJS; embedded images extracted automatically
 {
   "source_type": "EXCEL",
   "customer_id": "BUYER_X",
   "file_base64": "<base64>",
   "file_mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 }
+
+// EMAIL with raw MIME (inline images extracted automatically)
+{
+  "source_type": "EMAIL",
+  "customer_id": "BUYER_X",
+  "raw_email": "<full RFC822 / MIME multipart>"
+}
+
+// Any source_type — explicit additional images passed by the caller
+{
+  "source_type": "PDF",
+  "customer_id": "BUYER_X",
+  "file_base64": "<pdf base64>",
+  "file_mime": "application/pdf",
+  "attachments": [
+    { "file_base64": "<image base64>", "file_mime": "image/png", "filename": "annotation.png" }
+  ]
+}
 ```
+
+Embedded images:
+- **Excel:** anything in `xl/media/` inside the .xlsx zip is pulled out and sent as image content blocks (covers "Insert Picture", "Insert Picture in Cell", pasted screenshots).
+- **Email:** when `raw_email` is provided, the MIME multipart is parsed; `image/*` inline parts and CID-referenced images are passed to the LLM as image content blocks.
+- **Cap:** maximum 6 image blocks per request (cost control). Caller-supplied attachments are appended after auto-extracted ones, then truncated.
+
+Response includes `inline_images_processed: N` so callers can verify pickup.
 
 Max file size: 8 MB raw (Supabase request body limit is ~6 MB after base64 inflation).
 

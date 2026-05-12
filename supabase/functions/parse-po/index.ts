@@ -20,6 +20,8 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.30.0";
 import * as XLSX from "https://esm.sh/xlsx@0.18.5";
+import JSZip from "https://esm.sh/jszip@3.10.1";
+import PostalMime from "https://esm.sh/postal-mime@2.4.3";
 
 import { calculateCBM, type LineItem, type MasterArticle } from "../_shared/cbm.ts";
 import { applyReadinessFlags } from "../_shared/confidence.ts";
@@ -47,6 +49,7 @@ const XLSX_MIMES = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.ms-excel",
 ]);
+const MAX_INLINE_IMAGES = 6;  // cap total image blocks sent to Claude (token cost control)
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -54,10 +57,18 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
+interface InlineAttachment {
+  file_base64: string;
+  file_mime: string;
+  filename?: string;
+}
+
 interface ParseRequest {
-  document_content?: string;          // EMAIL / MANUAL
+  document_content?: string;          // EMAIL / MANUAL: plain text body
+  raw_email?: string;                 // EMAIL: full RFC822 / MIME multipart — inline images extracted automatically
   file_base64?: string;               // PDF / IMAGE / EXCEL — raw base64 (no data: prefix)
   file_mime?: string;                 // required when file_base64 is set
+  attachments?: InlineAttachment[];   // additional images to include for any source_type
   source_type: "PDF" | "IMAGE" | "EXCEL" | "EMAIL" | "MANUAL";
   customer_id: string;
 }
@@ -144,6 +155,113 @@ function xlsxBase64ToText(b64: string): string {
   return sheets.join("\n\n");
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  // Chunked to avoid argument stack overflow on large buffers
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function mimeFromExtension(filename: string): string | null {
+  const ext = filename.toLowerCase().split(".").pop() ?? "";
+  switch (ext) {
+    case "png":  return "image/png";
+    case "jpg":
+    case "jpeg": return "image/jpeg";
+    case "webp": return "image/webp";
+    case "gif":  return "image/gif";
+    default:     return null;  // emf/wmf/vector formats not supported by Anthropic
+  }
+}
+
+/**
+ * Extract embedded images from an xlsx file. Images live in xl/media/ within
+ * the .xlsx zip — both pasted "Insert Picture" and "Insert Picture in Cell"
+ * end up there. Returns base64-encoded image attachments suitable for
+ * Anthropic image content blocks.
+ */
+async function extractXlsxImages(b64: string): Promise<InlineAttachment[]> {
+  try {
+    const bytes = decodeBase64ToBytes(b64);
+    const zip = await JSZip.loadAsync(bytes);
+    const out: InlineAttachment[] = [];
+    for (const path of Object.keys(zip.files)) {
+      if (!path.startsWith("xl/media/")) continue;
+      const file = zip.files[path];
+      if (file.dir) continue;
+      const filename = path.split("/").pop() ?? "";
+      const mime = mimeFromExtension(filename);
+      if (!mime) continue;
+      const data = await file.async("uint8array");
+      if (data.length === 0) continue;
+      out.push({ file_base64: bytesToBase64(data), file_mime: mime, filename });
+    }
+    return out;
+  } catch (_e) {
+    return [];
+  }
+}
+
+/**
+ * Parse RFC822 MIME email into a text body + inline image attachments.
+ * Handles multipart/related (Outlook-style cid: references), multipart/mixed
+ * (regular attachments), and quoted-printable / base64 encodings transparently.
+ */
+async function parseRawEmail(raw: string): Promise<{
+  text: string;
+  attachments: InlineAttachment[];
+}> {
+  try {
+    // postal-mime is iso-edge-runtime compatible
+    // deno-lint-ignore no-explicit-any
+    const email = await (PostalMime as any).parse(raw);
+    const text = (email.text ?? stripHtml(email.html ?? "") ?? "").toString();
+    const attachments: InlineAttachment[] = [];
+    for (const att of email.attachments ?? []) {
+      const mime: string = att.mimeType ?? "";
+      if (!mime.startsWith("image/")) continue;
+      // postal-mime returns content as ArrayBuffer
+      const buf: ArrayBuffer = att.content;
+      const bytes = new Uint8Array(buf);
+      attachments.push({
+        file_base64: bytesToBase64(bytes),
+        file_mime: mime,
+        filename: att.filename ?? undefined,
+      });
+    }
+    return { text, attachments };
+  } catch (_e) {
+    // Fallback: treat as plain text
+    return { text: raw, attachments: [] };
+  }
+}
+
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function attachmentToBlock(att: InlineAttachment): UserContentBlock | null {
+  if (!IMAGE_MIMES.has(att.file_mime)) return null;
+  return {
+    type: "image",
+    source: { type: "base64", media_type: att.file_mime, data: att.file_base64 },
+  };
+}
+
 /**
  * Build the user content for the extraction LLM call based on source type.
  * Returns either a plain string (for text inputs) or an array of content
@@ -153,20 +271,53 @@ function xlsxBase64ToText(b64: string): string {
  * inputs this is the source_type label + customer_id (RAG isn't useful
  * until after first-pass extraction in that case).
  */
-function buildUserContent(req: ParseRequest): {
+async function buildUserContent(req: ParseRequest): Promise<{
   content: string | UserContentBlock[];
   text_proxy: string;
   error?: string;
-} {
+  inline_images_found?: number;
+}> {
   const st = req.source_type;
+  const callerAttachments = (req.attachments ?? []).slice();
 
+  // ---- EMAIL / MANUAL ----------------------------------------------------
   if (st === "EMAIL" || st === "MANUAL") {
-    if (!req.document_content) {
-      return { content: "", text_proxy: "", error: `${st} requires document_content` };
+    let bodyText: string | undefined;
+    let extractedAttachments: InlineAttachment[] = [];
+
+    if (st === "EMAIL" && req.raw_email) {
+      const parsed = await parseRawEmail(req.raw_email);
+      bodyText = parsed.text;
+      extractedAttachments = parsed.attachments;
+    } else {
+      bodyText = req.document_content;
     }
-    return { content: req.document_content, text_proxy: req.document_content };
+
+    if (!bodyText) {
+      return { content: "", text_proxy: "",
+        error: `${st} requires document_content or raw_email` };
+    }
+
+    const allImages = [...extractedAttachments, ...callerAttachments].slice(0, MAX_INLINE_IMAGES);
+    if (allImages.length === 0) {
+      return { content: bodyText, text_proxy: bodyText };
+    }
+
+    const blocks: UserContentBlock[] = [{ type: "text", text: bodyText }];
+    for (const att of allImages) {
+      const block = attachmentToBlock(att);
+      if (block) blocks.push(block);
+    }
+    blocks.push({
+      type: "text",
+      text: "The images above are inline attachments from the email body. They may show " +
+            "scanned PO sheets, product photos, or screenshots — extract any PO data you " +
+            "see in them and merge with the text above.",
+    });
+    return { content: blocks, text_proxy: bodyText, inline_images_found: allImages.length };
   }
 
+  // ---- PDF / IMAGE / EXCEL: validate file_base64 -------------------------
   if (!req.file_base64 || !req.file_mime) {
     return { content: "", text_proxy: "", error: `${st} requires file_base64 and file_mime` };
   }
@@ -180,12 +331,19 @@ function buildUserContent(req: ParseRequest): {
     if (req.file_mime !== PDF_MIME) {
       return { content: "", text_proxy: "", error: `PDF source_type requires file_mime=application/pdf` };
     }
+    const blocks: UserContentBlock[] = [
+      { type: "document", source: { type: "base64", media_type: "application/pdf", data: req.file_base64 } },
+    ];
+    const extras = callerAttachments.slice(0, MAX_INLINE_IMAGES);
+    for (const att of extras) {
+      const block = attachmentToBlock(att);
+      if (block) blocks.push(block);
+    }
+    blocks.push({ type: "text", text: "Extract this purchase order per the JSON schema in your system prompt." });
     return {
-      content: [
-        { type: "document", source: { type: "base64", media_type: "application/pdf", data: req.file_base64 } },
-        { type: "text", text: "Extract this purchase order per the JSON schema in your system prompt." },
-      ],
+      content: blocks,
       text_proxy: `PDF purchase order from customer ${req.customer_id}`,
+      inline_images_found: extras.length,
     };
   }
 
@@ -193,12 +351,19 @@ function buildUserContent(req: ParseRequest): {
     if (!IMAGE_MIMES.has(req.file_mime)) {
       return { content: "", text_proxy: "", error: `IMAGE source_type requires a known image mime, got ${req.file_mime}` };
     }
+    const blocks: UserContentBlock[] = [
+      { type: "image", source: { type: "base64", media_type: req.file_mime, data: req.file_base64 } },
+    ];
+    const extras = callerAttachments.slice(0, MAX_INLINE_IMAGES - 1);
+    for (const att of extras) {
+      const block = attachmentToBlock(att);
+      if (block) blocks.push(block);
+    }
+    blocks.push({ type: "text", text: "Extract this purchase order per the JSON schema in your system prompt." });
     return {
-      content: [
-        { type: "image", source: { type: "base64", media_type: req.file_mime, data: req.file_base64 } },
-        { type: "text", text: "Extract this purchase order per the JSON schema in your system prompt." },
-      ],
+      content: blocks,
       text_proxy: `Image purchase order from customer ${req.customer_id}`,
+      inline_images_found: extras.length,
     };
   }
 
@@ -206,13 +371,36 @@ function buildUserContent(req: ParseRequest): {
     if (!XLSX_MIMES.has(req.file_mime)) {
       return { content: "", text_proxy: "", error: `EXCEL source_type requires a spreadsheet mime, got ${req.file_mime}` };
     }
+    let csvText: string;
     try {
-      const text = xlsxBase64ToText(req.file_base64);
-      if (!text) return { content: "", text_proxy: "", error: "xlsx parsed to empty text" };
-      return { content: text, text_proxy: text };
+      csvText = xlsxBase64ToText(req.file_base64);
     } catch (e) {
       return { content: "", text_proxy: "", error: `xlsx parse failed: ${(e as Error).message}` };
     }
+    if (!csvText) {
+      return { content: "", text_proxy: "", error: "xlsx parsed to empty text" };
+    }
+
+    // Pull embedded images out of the xlsx zip (xl/media/*)
+    const embedded = await extractXlsxImages(req.file_base64);
+    const allImages = [...embedded, ...callerAttachments].slice(0, MAX_INLINE_IMAGES);
+
+    if (allImages.length === 0) {
+      return { content: csvText, text_proxy: csvText };
+    }
+
+    const blocks: UserContentBlock[] = [{ type: "text", text: csvText }];
+    for (const att of allImages) {
+      const block = attachmentToBlock(att);
+      if (block) blocks.push(block);
+    }
+    blocks.push({
+      type: "text",
+      text: "The images above were embedded in cells of the spreadsheet. They may " +
+            "contain product photos, scanned PO snippets, or annotations — extract " +
+            "any PO data visible in them and merge with the CSV text above.",
+    });
+    return { content: blocks, text_proxy: csvText, inline_images_found: allImages.length };
   }
 
   return { content: "", text_proxy: "", error: `unsupported source_type: ${st}` };
@@ -332,7 +520,7 @@ serve(async (req: Request): Promise<Response> => {
   }
 
   // Build LLM input (text string or content blocks) based on source type
-  const built = buildUserContent(payload);
+  const built = await buildUserContent(payload);
   if (built.error) {
     return json({ error: built.error }, 400);
   }
@@ -457,5 +645,6 @@ serve(async (req: Request): Promise<Response> => {
     extraction_id: inserted.id,
     normalized_po: normalized,
     model_used: modelUsed,
+    inline_images_processed: built.inline_images_found ?? 0,
   });
 });
