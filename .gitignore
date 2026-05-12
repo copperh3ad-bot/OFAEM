@@ -8,3 +8,8 @@ dist/
 .deno/
 coverage/
 *.log
+
+# Web app
+web/.env.local
+web/node_modules/
+web/dist/
