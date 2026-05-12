@@ -1,0 +1,19 @@
+{
+  "tasks": {
+    "test:unit": "deno test --allow-none tests/unit/",
+    "test:integration": "deno test --allow-env --allow-net tests/integration/",
+    "test": "deno task test:unit",
+    "seed": "deno run --allow-env --allow-net scripts/seed_master_articles.ts",
+    "lint": "deno lint supabase/ tests/ scripts/",
+    "fmt": "deno fmt supabase/ tests/ scripts/"
+  },
+  "lint": {
+    "rules": { "tags": ["recommended"] }
+  },
+  "fmt": {
+    "lineWidth": 110,
+    "indentWidth": 2,
+    "semiColons": true,
+    "singleQuote": false
+  }
+}

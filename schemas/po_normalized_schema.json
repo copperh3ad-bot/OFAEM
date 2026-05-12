@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ofaem.union-fabrics.local/schemas/po_normalized_schema.json",
+  "title": "Normalized Purchase Order",
+  "description": "Immutable contract between extraction pipeline and downstream ERP consumers.",
+  "type": "object",
+  "required": ["metadata", "line_items", "flags", "totals", "validation_summary"],
+  "additionalProperties": false,
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["po_id", "customer_id", "currency", "source_document_type", "extracted_at", "parsed_by_version"],
+      "additionalProperties": false,
+      "properties": {
+        "po_id":                 { "type": "string", "minLength": 1, "maxLength": 128 },
+        "po_date":               { "type": ["string", "null"], "format": "date" },
+        "customer_id":           { "type": "string", "minLength": 1, "maxLength": 64 },
+        "currency":              { "type": "string", "enum": ["USD","EUR","GBP","PKR","INR","CNY","JPY","AED","BDT","TRY"] },
+        "source_document_type":  { "type": "string", "enum": ["PDF","IMAGE","EXCEL","EMAIL","MANUAL"] },
+        "payment_method":        { "type": ["string","null"], "enum": ["LC","TT","CAD","DA","DP","CREDIT", null] },
+        "delivery_destination":  { "type": ["string","null"], "maxLength": 256 },
+        "consignee":             { "type": ["string","null"], "maxLength": 256 },
+        "extracted_at":          { "type": "string", "format": "date-time" },
+        "parsed_by_version":     { "type": "string", "maxLength": 32 }
+      }
+    },
+    "line_items": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "required": ["line_no", "sku", "description", "quantity", "unit", "unit_price", "sku_confidence", "requires_review"],
+        "additionalProperties": false,
+        "properties": {
+          "line_no":             { "type": "integer", "minimum": 1 },
+          "sku":                 { "type": "string", "minLength": 1, "maxLength": 64 },
+          "description":         { "type": "string", "maxLength": 512 },
+          "quantity":            { "type": "number", "minimum": 0 },
+          "unit":                { "type": "string", "enum": ["METER","YARD","KG","PIECE","ROLL","BOX","BOLT","LITER"] },
+          "unit_price":          { "type": "number", "minimum": 0 },
+          "line_total":          { "type": "number", "minimum": 0 },
+          "dimensions": {
+            "type": ["object","null"],
+            "additionalProperties": false,
+            "properties": {
+              "length_m":         { "type": "number", "minimum": 0 },
+              "width_m":          { "type": "number", "minimum": 0 },
+              "height_m":         { "type": "number", "minimum": 0 },
+              "volume_per_unit":  { "type": "number", "minimum": 0 },
+              "resolution_tier":  { "type": "string", "enum": ["EXPLICIT","SKU_LOOKUP","HEURISTIC"] },
+              "confidence":       { "type": "number", "minimum": 0, "maximum": 1 }
+            }
+          },
+          "cbm":                  { "type": ["number","null"], "minimum": 0 },
+          "cbm_calculated":       { "type": "boolean" },
+          "sku_confidence":       { "type": "number", "minimum": 0, "maximum": 1 },
+          "quantity_confidence":  { "type": "number", "minimum": 0, "maximum": 1 },
+          "unit_confidence":      { "type": "number", "minimum": 0, "maximum": 1 },
+          "price_confidence":     { "type": "number", "minimum": 0, "maximum": 1 },
+          "requires_review":      { "type": "boolean" },
+          "review_reason":        { "type": ["string","null"], "maxLength": 256 }
+        }
+      }
+    },
+    "flags": {
+      "type": "object",
+      "required": ["is_ready_for_invoicing", "requires_review"],
+      "additionalProperties": false,
+      "properties": {
+        "is_ready_for_invoicing": { "type": "boolean" },
+        "requires_review":        { "type": "boolean" },
+        "cbm_calculated":         { "type": "boolean" }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "required": ["total_items", "total_value", "total_cbm"],
+      "additionalProperties": false,
+      "properties": {
+        "total_items":            { "type": "integer", "minimum": 0 },
+        "total_value":            { "type": "number", "minimum": 0 },
+        "total_cbm":              { "type": "number", "minimum": 0 }
+      }
+    },
+    "validation_summary": {
+      "type": "object",
+      "required": ["total_errors", "total_warnings", "items_requiring_review", "passed"],
+      "additionalProperties": false,
+      "properties": {
+        "total_errors":            { "type": "integer", "minimum": 0 },
+        "total_warnings":          { "type": "integer", "minimum": 0 },
+        "items_requiring_review":  { "type": "integer", "minimum": 0 },
+        "passed":                  { "type": "boolean" }
+      }
+    }
+  }
+}
