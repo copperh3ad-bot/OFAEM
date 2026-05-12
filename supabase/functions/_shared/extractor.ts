@@ -31,6 +31,7 @@ import {
   validateMetadata,
   validateLineItem,
 } from "./safety.ts";
+import { MetricsRecorder } from "./metrics.ts";
 
 const MATCHER_CONCURRENCY = 5;
 
@@ -315,6 +316,7 @@ async function callAnthropic(
   model: string,
   systemPrompt: string,
   userContent: string | UserContentBlock[],
+  metrics?: MetricsRecorder,
 ): Promise<RawExtraction | null> {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), LLM_TIMEOUT_MS);
@@ -326,6 +328,7 @@ async function callAnthropic(
       },
       { signal: ctl.signal },
     ));
+    metrics?.recordLLMCall(model, resp.usage);
     const text = resp.content[0]?.type === "text" ? resp.content[0].text : "";
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
@@ -428,6 +431,7 @@ export async function runExtraction(
   supabase: any,
   anthropic: Anthropic,
   request: ExtractRequest,
+  metrics?: MetricsRecorder,
 ): Promise<ExtractResponse> {
   if (!request.source_type || !request.customer_id) {
     return { success: false, status: 400, error: "missing required fields: source_type, customer_id" };
@@ -448,10 +452,10 @@ export async function runExtraction(
       })),
     );
 
-  let extraction = await callAnthropic(anthropic, HAIKU_MODEL, systemPrompt, built.content);
+  let extraction = await callAnthropic(anthropic, HAIKU_MODEL, systemPrompt, built.content, metrics);
   let modelUsed = HAIKU_MODEL;
   if (!extraction || extraction._confidence?.overall < CONFIDENCE_FALLBACK_THRESHOLD) {
-    const sonnet = await callAnthropic(anthropic, SONNET_MODEL, systemPrompt, built.content);
+    const sonnet = await callAnthropic(anthropic, SONNET_MODEL, systemPrompt, built.content, metrics);
     if (sonnet) { extraction = sonnet; modelUsed = SONNET_MODEL; }
   }
 

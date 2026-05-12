@@ -21,6 +21,12 @@ import PostalMime from "https://esm.sh/postal-mime@2.4.3";
 
 import { classifyEmail, IS_PO_THRESHOLD, type ClassifierResult } from "../_shared/email_classifier.ts";
 import { runExtraction } from "../_shared/extractor.ts";
+import { MetricsRecorder } from "../_shared/metrics.ts";
+import { applyRateLimit, rateLimitResponse } from "../_shared/rate_limit.ts";
+
+// Per-sender-domain rate limit: 100 inbound emails per 5-minute window
+const RL_MAX = 100;
+const RL_WINDOW_SECS = 300;
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -210,13 +216,31 @@ serve(async (req: Request): Promise<Response> => {
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+  const metrics = new MetricsRecorder("ingest-email");
 
   // Parse MIME
   let parsed: ParsedEmail;
   try {
     parsed = await parseEmail(payload.raw_email);
   } catch (e) {
+    await metrics.flush(supabase, "failure", { error_code: "email_parse_failed" });
     return json({ error: `email parse failed: ${(e as Error).message}` }, 400);
+  }
+
+  // Rate limit per sender domain (or full email when domain is shared)
+  const senderDomain = (parsed.from_address.match(/@([\w.-]+)/)?.[1] ?? "unknown").toLowerCase();
+  const rl = await applyRateLimit(supabase, {
+    key: `ingest-email:domain:${senderDomain}`,
+    max: RL_MAX,
+    window_seconds: RL_WINDOW_SECS,
+  });
+  if (!rl.allowed) {
+    await metrics.flush(supabase, "failure", {
+      customer_id: senderDomain,
+      error_code: "rate_limit_exceeded",
+      metadata: { current_count: rl.current_count, domain: senderDomain },
+    });
+    return rateLimitResponse(rl);
   }
 
   // Idempotency: have we already successfully processed this Message-ID?
@@ -230,6 +254,11 @@ serve(async (req: Request): Promise<Response> => {
       .in("classification", ["PO", "NOT_PO"])
       .maybeSingle();
     if (existing) {
+      await metrics.flush(supabase, "success", {
+        customer_id: senderDomain,
+        error_code: "duplicate_message_id",
+        metadata: { prior_classification: existing.classification },
+      });
       return json({
         success: true,
         skipped: true,
@@ -256,6 +285,10 @@ serve(async (req: Request): Promise<Response> => {
     await logIngest(supabase, parsed, classification, "NOT_PO", {
       customer_id: customerId, processing_ms: Date.now() - startedAt,
     });
+    await metrics.flush(supabase, "success", {
+      customer_id: customerId,
+      metadata: { classification: "NOT_PO", confidence: classification.confidence },
+    });
     return json({
       success: true,
       classification: "NOT_PO",
@@ -269,13 +302,17 @@ serve(async (req: Request): Promise<Response> => {
     source_type: "EMAIL",
     customer_id: customerId,
     raw_email: payload.raw_email,
-  });
+  }, metrics);
 
   if (!result.success) {
     await logIngest(supabase, parsed, classification, "ERROR", {
       customer_id: customerId,
       error_detail: result.error ?? "unknown",
       processing_ms: Date.now() - startedAt,
+    });
+    await metrics.flush(supabase, "failure", {
+      customer_id: customerId,
+      error_code: result.error ?? "extraction_failed",
     });
     return json({
       success: false,
@@ -290,6 +327,16 @@ serve(async (req: Request): Promise<Response> => {
     customer_id: customerId,
     extraction_id: result.extraction_id,
     processing_ms: Date.now() - startedAt,
+  });
+  await metrics.flush(supabase, "success", {
+    customer_id: customerId,
+    extraction_id: result.extraction_id,
+    metadata: {
+      classification: "PO",
+      confidence: classification.confidence,
+      is_revision: result.version?.is_revision,
+      inline_images: result.inline_images_processed,
+    },
   });
 
   return json({
