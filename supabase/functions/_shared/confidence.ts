@@ -1,8 +1,8 @@
 /**
  * Confidence rollup: per-line-item flags + overall is_ready_for_invoicing gate.
  *
- * Thresholds align with fuzzy match scoring:
- *   sku_confidence < 0.80   → review (fuzzy match below ~78/100)
+ * Thresholds:
+ *   sku_confidence < 0.80   → review (AI matcher unsure)
  *   field_confidence < 0.75 → review
  *   dimensions HEURISTIC    → review (estimated volume)
  */
@@ -59,9 +59,3 @@ export function applyReadinessFlags(
   };
 }
 
-/** Map fuzzy match score [70..100] → confidence [0.60..0.99]. */
-export function fuzzyScoreToConfidence(score: number): number {
-  if (score < 70) return 0;
-  if (score >= 100) return 0.99;
-  return Math.round((0.60 + (score - 70) * (0.39 / 30)) * 1000) / 1000;
-}

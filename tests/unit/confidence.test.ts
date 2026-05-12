@@ -1,5 +1,5 @@
 import { assertEquals, assert } from "https://deno.land/std@0.208.0/assert/mod.ts";
-import { applyReadinessFlags, fuzzyScoreToConfidence } from "../../supabase/functions/_shared/confidence.ts";
+import { applyReadinessFlags } from "../../supabase/functions/_shared/confidence.ts";
 import type { LineItem } from "../../supabase/functions/_shared/cbm.ts";
 
 Deno.test("low sku_confidence flags requires_review", () => {
@@ -50,10 +50,3 @@ Deno.test("empty line_items never produces ready=true", () => {
   assertEquals(r.is_ready_for_invoicing, false);
 });
 
-Deno.test("fuzzyScoreToConfidence: 70 → 0.60, 100 → 0.99, <70 → 0", () => {
-  assertEquals(fuzzyScoreToConfidence(69), 0);
-  assertEquals(fuzzyScoreToConfidence(70), 0.6);
-  assertEquals(fuzzyScoreToConfidence(100), 0.99);
-  const mid = fuzzyScoreToConfidence(85);
-  assert(mid > 0.78 && mid < 0.81, `expected ~0.80 got ${mid}`);
-});

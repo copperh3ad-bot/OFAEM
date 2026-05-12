@@ -75,5 +75,5 @@ export function buildFewShotContext(masterArticles: Array<{
     .slice(0, 15)
     .map((a) => `  - ${a.sku} | ${a.unit} | ${a.description}`)
     .join("\n");
-  return `\n\nKnown SKU catalog (for fuzzy matching reference; prefer these over fabricating new SKUs):\n${rows}\n`;
+  return `\n\nKnown SKU catalog (reference; prefer these SKUs over fabricating new ones):\n${rows}\n`;
 }
