@@ -17,6 +17,8 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.30.0";
 import { getCallerIdentity, callerHasRole, unauthorizedResponse } from "../_shared/auth.ts";
+import { withRetry } from "../_shared/retry.ts";
+import { INJECTION_GUARD_SYSTEM_LINE, wrapUntrusted } from "../_shared/safety.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -122,12 +124,12 @@ async function generateMitigation(
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), MITIGATION_TIMEOUT_MS);
   try {
-    const resp = await anthropic.messages.create({
+    const resp = await withRetry(() => anthropic.messages.create({
       model: MITIGATION_MODEL,
       max_tokens: 1024,
-      system: MITIGATION_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: context }],
-    }, { signal: ctl.signal });
+      system: MITIGATION_SYSTEM_PROMPT + "\n\n" + INJECTION_GUARD_SYSTEM_LINE,
+      messages: [{ role: "user", content: wrapUntrusted("buyer_text", context) }],
+    }, { signal: ctl.signal }));
     const text = resp.content[0]?.type === "text" ? resp.content[0].text : "";
     if (!text) return { plan: null, model: MITIGATION_MODEL, debug: "empty_response" };
     const match = text.match(/\{[\s\S]*\}/);

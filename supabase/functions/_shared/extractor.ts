@@ -23,6 +23,16 @@ import {
   buildFewShotContext,
   PARSING_PIPELINE_VERSION,
 } from "./prompts.ts";
+import { withRetry } from "./retry.ts";
+import { pLimit } from "./concurrency.ts";
+import {
+  INJECTION_GUARD_SYSTEM_LINE,
+  wrapUntrusted,
+  validateMetadata,
+  validateLineItem,
+} from "./safety.ts";
+
+const MATCHER_CONCURRENCY = 5;
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const SONNET_MODEL = "claude-sonnet-4-6";
@@ -228,10 +238,13 @@ async function buildUserContent(req: ExtractRequest): Promise<{
     }
     if (!bodyText) return { content: "", text_proxy: "", error: `${st} requires document_content or raw_email` };
 
-    const allImages = [...extractedAttachments, ...callerAttachments].slice(0, MAX_INLINE_IMAGES);
-    if (allImages.length === 0) return { content: bodyText, text_proxy: bodyText };
+    // Wrap buyer-controlled text in delimiters the system prompt is told to ignore as instructions
+    const wrappedBody = wrapUntrusted("buyer_document", bodyText);
 
-    const blocks: UserContentBlock[] = [{ type: "text", text: bodyText }];
+    const allImages = [...extractedAttachments, ...callerAttachments].slice(0, MAX_INLINE_IMAGES);
+    if (allImages.length === 0) return { content: wrappedBody, text_proxy: bodyText };
+
+    const blocks: UserContentBlock[] = [{ type: "text", text: wrappedBody }];
     for (const att of allImages) { const b = attachmentToBlock(att); if (b) blocks.push(b); }
     blocks.push({ type: "text",
       text: "The images above are inline attachments from the email body. They may show scanned PO sheets, " +
@@ -280,11 +293,13 @@ async function buildUserContent(req: ExtractRequest): Promise<{
     catch (e) { return { content: "", text_proxy: "", error: `xlsx parse failed: ${(e as Error).message}` }; }
     if (!csvText) return { content: "", text_proxy: "", error: "xlsx parsed to empty text" };
 
+    const wrappedCsv = wrapUntrusted("buyer_document", csvText);
+
     const embedded = await extractXlsxImages(req.file_base64);
     const allImages = [...embedded, ...callerAttachments].slice(0, MAX_INLINE_IMAGES);
-    if (allImages.length === 0) return { content: csvText, text_proxy: csvText };
+    if (allImages.length === 0) return { content: wrappedCsv, text_proxy: csvText };
 
-    const blocks: UserContentBlock[] = [{ type: "text", text: csvText }];
+    const blocks: UserContentBlock[] = [{ type: "text", text: wrappedCsv }];
     for (const att of allImages) { const b = attachmentToBlock(att); if (b) blocks.push(b); }
     blocks.push({ type: "text",
       text: "The images above were embedded in cells of the spreadsheet. They may contain product photos, " +
@@ -304,13 +319,13 @@ async function callAnthropic(
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), LLM_TIMEOUT_MS);
   try {
-    const resp = await client.messages.create(
+    const resp = await withRetry(() => client.messages.create(
       {
         model, max_tokens: MAX_TOKENS, system: systemPrompt,
         messages: [{ role: "user", content: userContent as unknown as string }],
       },
       { signal: ctl.signal },
-    );
+    ));
     const text = resp.content[0]?.type === "text" ? resp.content[0].text : "";
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
@@ -342,10 +357,12 @@ async function aiReconcileSKUs(
   quantity_confidence: number; unit_confidence: number; price_confidence: number;
   match_reasoning: string; _matched_master: MasterArticle | null;
 }>> {
-  const matches = await Promise.all(items.map((item) =>
+  // Bound concurrency so a 50-line PO doesn't fire 50 simultaneous Anthropic calls
+  const limit = pLimit(MATCHER_CONCURRENCY);
+  const matches = await Promise.all(items.map((item) => limit(() =>
     matchSKU(supabase, anthropic, {
       llm_sku: item.sku, description: item.description, llm_sku_confidence: item.sku_confidence ?? 0.5,
-    })));
+    }))));
 
   return items.map((item, idx) => {
     const m = matches[idx];
@@ -421,13 +438,15 @@ export async function runExtraction(
 
   const masterArticles = await fetchMasterArticlesForRAG(supabase, built.text_proxy);
 
-  const systemPrompt = SYSTEM_PROMPT_PO_EXTRACTION + buildFewShotContext(
-    masterArticles.map((m) => ({
-      sku: m.sku,
-      description: (m as unknown as { description?: string }).description ?? "",
-      unit: m.unit ?? "",
-    })),
-  );
+  const systemPrompt = SYSTEM_PROMPT_PO_EXTRACTION
+    + "\n\n" + INJECTION_GUARD_SYSTEM_LINE
+    + buildFewShotContext(
+      masterArticles.map((m) => ({
+        sku: m.sku,
+        description: (m as unknown as { description?: string }).description ?? "",
+        unit: m.unit ?? "",
+      })),
+    );
 
   let extraction = await callAnthropic(anthropic, HAIKU_MODEL, systemPrompt, built.content);
   let modelUsed = HAIKU_MODEL;
@@ -446,13 +465,22 @@ export async function runExtraction(
   }
 
   const reconciledItems = await aiReconcileSKUs(supabase, anthropic, extraction.line_items ?? []);
+
+  // Post-extraction enum validation: catch hallucinated currencies / units /
+  // negative quantities BEFORE they reach downstream systems.
+  const metaCheck = validateMetadata({
+    currency: extraction.metadata?.currency as string | undefined,
+    payment_method: extraction.metadata?.payment_method as string | null | undefined,
+  });
+  const validatedItems = reconciledItems.map((it) => validateLineItem(it).cleaned);
+
   const masterLookup = new Map<string, MasterArticle>();
   for (const m of masterArticles) masterLookup.set(m.sku, m);
-  for (const item of reconciledItems) {
+  for (const item of validatedItems) {
     const matched = (item as unknown as { _matched_master: MasterArticle | null })._matched_master;
     if (matched) masterLookup.set(matched.sku, matched);
   }
-  const enriched = calculateCBM(reconciledItems, masterLookup);
+  const enriched = calculateCBM(validatedItems, masterLookup);
   const readiness = applyReadinessFlags(enriched, 0);
   const totalValue = readiness.items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
   const totalCBM = readiness.items.reduce((s, i) => s + (i.cbm ?? 0), 0);
@@ -462,9 +490,9 @@ export async function runExtraction(
       po_id: String(extraction.metadata?.po_id ?? `AUTO-${Date.now()}`),
       po_date: extraction.metadata?.po_date ?? null,
       customer_id: request.customer_id,
-      currency: extraction.metadata?.currency ?? "USD",
+      currency: metaCheck.cleaned_currency,
       source_document_type: request.source_type,
-      payment_method: extraction.metadata?.payment_method ?? null,
+      payment_method: metaCheck.cleaned_payment_method,
       delivery_destination: extraction.metadata?.delivery_destination ?? null,
       consignee: extraction.metadata?.consignee ?? null,
       extracted_at: new Date().toISOString(),
@@ -557,6 +585,21 @@ export async function runExtraction(
   }
 
   await logLowConfidenceFields(supabase, normalized.metadata.po_id, request.source_type, readiness.items);
+
+  // Surface metadata-validation warnings (invalid currency / payment terms) to error_log
+  if (metaCheck.warnings.length > 0) {
+    await supabase.from("error_log").insert(
+      metaCheck.warnings.map((w) => ({
+        message: `Metadata field "${w.field}" outside allowed enum (original: ${JSON.stringify(w.original)}) — replaced with default`,
+        severity: "warning",
+        category: "extraction",
+        affected_field: w.field,
+        reason_code: w.reason,
+        source_type: request.source_type,
+        context: JSON.stringify({ po_id: normalized.metadata.po_id, original: w.original }),
+      }))
+    );
+  }
 
   return {
     success: true,
