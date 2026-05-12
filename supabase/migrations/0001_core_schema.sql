@@ -1,6 +1,10 @@
 -- 0001_core_schema.sql
 -- Core tables for OFAEM: user_profiles (auth-linked), master_articles, ai_extractions
 
+-- Required extension for trigram description search (used by RAG retrieval).
+-- Must be created BEFORE any index that uses gin_trgm_ops.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 CREATE TABLE IF NOT EXISTS user_profiles (
   id          UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   email       TEXT UNIQUE NOT NULL,
@@ -30,9 +34,6 @@ CREATE TABLE IF NOT EXISTS master_articles (
 CREATE INDEX IF NOT EXISTS idx_master_articles_category ON master_articles(category);
 CREATE INDEX IF NOT EXISTS idx_master_articles_description_trgm
   ON master_articles USING GIN (description gin_trgm_ops);
-
--- Required extension for trigram description search (used by RAG retrieval)
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS ai_extractions (
   id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),

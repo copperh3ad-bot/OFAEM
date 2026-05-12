@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS error_patterns (
   id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   category           TEXT NOT NULL,
   reason_code        TEXT,
-  affected_field     TEXT,
+  affected_field     TEXT NOT NULL DEFAULT '',
   source_type        TEXT NOT NULL DEFAULT 'UNKNOWN',
   occurrence_count   INTEGER NOT NULL DEFAULT 1,
   last_seen          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS error_patterns (
   is_active          BOOLEAN DEFAULT true,
   created_at         TIMESTAMPTZ DEFAULT now(),
   updated_at         TIMESTAMPTZ DEFAULT now(),
-  UNIQUE (category, COALESCE(affected_field, ''), source_type)
+  UNIQUE (category, affected_field, source_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_error_patterns_count  ON error_patterns (occurrence_count DESC);
@@ -83,11 +83,11 @@ BEGIN
   VALUES (
     NEW.category,
     NEW.reason_code,
-    NEW.affected_field,
+    COALESCE(NEW.affected_field, ''),
     COALESCE(NEW.source_type, 'UNKNOWN'),
     1, NEW.created_at, true, now(), now()
   )
-  ON CONFLICT (category, COALESCE(affected_field, ''), source_type)
+  ON CONFLICT (category, affected_field, source_type)
   DO UPDATE SET
     occurrence_count = error_patterns.occurrence_count + 1,
     last_seen        = EXCLUDED.last_seen,

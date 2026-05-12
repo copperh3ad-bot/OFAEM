@@ -1,4 +1,8 @@
-<!DOCTYPE html>
+// Inlined Eta template for proforma invoice.
+// Kept as a TS export so `supabase functions deploy` picks it up as a static import.
+// Edit the template HTML below and redeploy — no separate asset upload needed.
+
+export const PROFORMA_TEMPLATE = String.raw`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -99,4 +103,4 @@
 </div>
 
 </body>
-</html>
+</html>`;
