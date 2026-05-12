@@ -3,10 +3,10 @@
 // POST { document_content: string, source_type: "PDF"|"IMAGE"|"EXCEL"|"EMAIL"|"MANUAL", customer_id: string }
 //
 // Pipeline:
-//   1. Fetch RAG context (top master_articles by description keywords)
+//   1. Fetch RAG context (top master_articles by pg_trgm similarity to document)
 //   2. Call Claude Haiku with extraction prompt
 //   3. If _confidence.overall < 0.70 → retry on Sonnet
-//   4. Reconcile SKUs against master_articles via fuzzy match → adjust sku_confidence
+//   4. AI SKU matching: per-line trigram pre-filter → Claude disambiguation
 //   5. CBM enrichment (three-tier resolution)
 //   6. Apply readiness rollup → is_ready_for_invoicing
 //   7. Persist to ai_extractions; emit error_log rows for low-confidence fields
@@ -16,8 +16,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.30.0";
 
 import { calculateCBM, type LineItem, type MasterArticle } from "../_shared/cbm.ts";
-import { applyReadinessFlags, fuzzyScoreToConfidence } from "../_shared/confidence.ts";
-import { bestMatch } from "../_shared/fuzzy.ts";
+import { applyReadinessFlags } from "../_shared/confidence.ts";
+import { matchSKU } from "../_shared/sku_matcher.ts";
 import {
   SYSTEM_PROMPT_PO_EXTRACTION,
   buildFewShotContext,
@@ -65,17 +65,6 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function extractKeywords(content: string): string[] {
-  const words = content.toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) ?? [];
-  const stop = new Set(["the","and","for","with","from","this","that","please","order","purchase","total","unit","price","qty"]);
-  const freq = new Map<string, number>();
-  for (const w of words) {
-    if (stop.has(w)) continue;
-    freq.set(w, (freq.get(w) ?? 0) + 1);
-  }
-  return [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([w]) => w);
-}
-
 async function callAnthropic(
   client: Anthropic,
   model: string,
@@ -105,44 +94,55 @@ async function callAnthropic(
   }
 }
 
-async function fetchMasterArticles(
+async function fetchMasterArticlesForRAG(
   supabase: ReturnType<typeof createClient>,
-  keywords: string[],
+  documentContent: string,
 ): Promise<MasterArticle[]> {
-  if (keywords.length === 0) return [];
-  const orClause = keywords.map((k) => `description.ilike.%${k}%`).join(",");
-  const { data, error } = await supabase
-    .from("master_articles")
-    .select("sku, description, unit, category, standard_dimensions")
-    .or(orClause)
-    .limit(20);
-  if (error) return [];
-  return (data ?? []) as MasterArticle[];
+  // Use the same trigram RPC, but with a higher candidate cap for the few-shot prompt
+  const { data, error } = await supabase.rpc("find_similar_articles", {
+    query_text: documentContent.slice(0, 4000),
+    match_limit: 20,
+    min_similarity: 0.05,
+  });
+  if (error || !Array.isArray(data)) return [];
+  return data as MasterArticle[];
 }
 
-function reconcileSKUs(
+async function aiReconcileSKUs(
+  supabase: ReturnType<typeof createClient>,
+  anthropic: Anthropic,
   items: RawExtraction["line_items"],
-  master: MasterArticle[],
-): LineItem[] {
-  const masterPairs = master.map((m) => ({
-    sku: m.sku,
-    description: (m as unknown as { description?: string }).description ?? "",
-  }));
+): Promise<Array<LineItem & {
+  quantity_confidence: number;
+  unit_confidence: number;
+  price_confidence: number;
+  match_reasoning: string;
+}>> {
+  // Per-line AI matching: trigram pre-filter via RPC → Claude disambiguation
+  const matches = await Promise.all(
+    items.map((item) =>
+      matchSKU(supabase as unknown as Parameters<typeof matchSKU>[0], anthropic, {
+        llm_sku: item.sku,
+        description: item.description,
+        llm_sku_confidence: item.sku_confidence ?? 0.5,
+      })
+    ),
+  );
 
   return items.map((item, idx) => {
+    const m = matches[idx];
     const llmConfidence = item.sku_confidence ?? 0.5;
-    const match = bestMatch(item.sku, item.description, masterPairs);
+
     let finalSku = item.sku;
     let skuConfidence = llmConfidence;
 
-    if (match) {
-      finalSku = match.sku;
-      const fuzzyConf = fuzzyScoreToConfidence(match.score);
-      // Take the higher of LLM confidence and fuzzy-derived confidence
-      skuConfidence = Math.max(llmConfidence, fuzzyConf);
+    if (m.matched_sku) {
+      finalSku = m.matched_sku;
+      // Combine signals: trust the matcher's confidence, floored by extraction confidence
+      skuConfidence = Math.max(m.confidence, Math.min(llmConfidence, 0.95));
     } else if (llmConfidence > 0.5) {
-      // LLM was confident but no master match → cap confidence at 0.65
-      skuConfidence = Math.min(llmConfidence, 0.65);
+      // No master match found by AI: cap confidence so the line is flagged for review
+      skuConfidence = Math.min(llmConfidence, 0.60);
     }
 
     return {
@@ -157,7 +157,16 @@ function reconcileSKUs(
       quantity_confidence: item.quantity_confidence ?? 0.9,
       unit_confidence: item.unit_confidence ?? 0.9,
       price_confidence: item.price_confidence ?? 0.9,
-    } as LineItem & Record<string, unknown>;
+      // Stash matched master for CBM resolver below
+      _matched_master: m.master_article,
+      match_reasoning: m.reasoning,
+    } as LineItem & {
+      quantity_confidence: number;
+      unit_confidence: number;
+      price_confidence: number;
+      match_reasoning: string;
+      _matched_master: MasterArticle | null;
+    };
   });
 }
 
@@ -201,8 +210,7 @@ serve(async (req: Request): Promise<Response> => {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-  const keywords = extractKeywords(payload.document_content);
-  const masterArticles = await fetchMasterArticles(supabase, keywords);
+  const masterArticles = await fetchMasterArticlesForRAG(supabase, payload.document_content);
 
   const systemPrompt = SYSTEM_PROMPT_PO_EXTRACTION + buildFewShotContext(
     masterArticles.map((m) => ({
@@ -235,11 +243,17 @@ serve(async (req: Request): Promise<Response> => {
     return json({ error: "extraction failed" }, 502);
   }
 
-  // SKU reconciliation
-  const reconciledItems = reconcileSKUs(extraction.line_items ?? [], masterArticles);
+  // AI-driven SKU matching (trigram pre-filter → Claude disambiguation per line)
+  const reconciledItems = await aiReconcileSKUs(supabase, anthropic, extraction.line_items ?? []);
 
-  // CBM enrichment
-  const masterLookup = new Map(masterArticles.map((m) => [m.sku, m]));
+  // CBM enrichment — build lookup from the AI-matched master rows directly
+  // so a matched SKU's standard_dimensions always reach the resolver.
+  const masterLookup = new Map<string, MasterArticle>();
+  for (const m of masterArticles) masterLookup.set(m.sku, m);
+  for (const item of reconciledItems) {
+    const matched = (item as unknown as { _matched_master: MasterArticle | null })._matched_master;
+    if (matched) masterLookup.set(matched.sku, matched);
+  }
   const enriched = calculateCBM(reconciledItems, masterLookup);
 
   // Readiness rollup
