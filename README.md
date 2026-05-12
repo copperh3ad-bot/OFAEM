@@ -8,13 +8,53 @@ into a validated, structured contract suitable for downstream ERP consumption.
 ## Pipeline
 
 ```
-Raw PO (PDF / IMG / XLSX / EMAIL)
-  → parse-po edge function (Anthropic Claude, Haiku→Sonnet confidence fallback)
-  → AI-driven SKU matching (pg_trgm pre-filter → Claude disambiguation per line)
-  → ai_extractions table (normalized JSON + per-field confidence)
+Inbound email (webhook from Gmail / SES / Mailgun / IMAP poller)
+  → ingest-email edge function
+      → MIME parse → classifier (is this a PO? confidence ≥ 0.65)
+      → if PO: idempotency check on Message-ID, then call extractor
+  → parse-po edge function (or runExtraction in-process)
+      → Anthropic Claude, Haiku → Sonnet confidence fallback
+      → AI-driven SKU matching (pg_trgm pre-filter → Claude disambiguation)
+      → CBM enrichment (three-tier resolution)
+      → revision detection (supersede prior version of same po_id; store diff)
+  → ai_extractions table (versioned, only current version flagged)
   → human review (cell edits → ml_feedback for ML loop)
-  → render-proforma edge function (CBM enrichment + invoice HTML)
+  → render-proforma edge function (CBM totals + invoice HTML)
   → proforma_invoices table (checksum, sign-off gated by role)
+```
+
+## Auto-import from email
+
+`POST /functions/v1/ingest-email` — accepts a raw MIME email and:
+
+1. Parses MIME (text body + attachments), classifies it via Claude Haiku
+2. If classifier says it's NOT a PO (e.g. status inquiry, RFQ, complaint): logs to `email_ingest_log` with classification=NOT_PO and exits
+3. If it IS a PO: runs extraction in-process, returns the normalized PO
+4. Deduplicates on RFC822 Message-ID (same email retried → no duplicate extraction)
+5. If a prior extraction exists for the same `(customer_id, po_id)`:
+   - new row gets `version_number = prior + 1`
+   - prior row is marked `is_current_version=false`, `superseded_by_id=<new>`
+   - structured diff of changes is stored on the new row in `revision_diff` JSONB
+
+Default `customer_id` is derived from the sender email domain — caller can override.
+
+Wire it to your mail provider:
+
+| Provider | How |
+|---|---|
+| Gmail | Watch + Pub/Sub → Cloud Function → POST raw_email |
+| AWS SES | SES rule → Lambda → POST raw_email |
+| Mailgun | Mailgun Routes → forward to your function URL |
+| SendGrid | Inbound Parse → POST to your function URL |
+| Plain IMAP | Cron job polling IMAP → POST each new message |
+
+Request shape:
+```json
+{
+  "raw_email": "<full RFC822 message>",
+  "customer_id": "BUYER_X",      // optional; defaults to sender domain
+  "source_label": "gmail-inbox"  // optional, for logging
+}
 ```
 
 ## Request formats
