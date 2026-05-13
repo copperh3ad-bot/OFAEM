@@ -65,10 +65,12 @@ const HEURISTIC_FALLBACK_M3 = 0.01;
 
 function classifyCategory(description: string): string {
   const d = description.toLowerCase();
-  if (/(fabric|cotton|polyester|linen|denim|silk|wool)/.test(d)) return "fabric";
-  if (/yarn|thread/.test(d)) return "yarn";
-  if (/(shirt|trouser|garment|tee|t-shirt|dress|jacket|hoodie)/.test(d)) return "garment";
+  // Order matters: yarn often contains "cotton" (e.g. "cotton yarn cone") and
+  // would otherwise be misclassified as fabric. Check yarn first.
+  if (/yarn|thread|cone(?!\w)/.test(d)) return "yarn";
+  if (/(shirt|trouser|garment|tee|t-shirt|dress|jacket|hoodie|pant|polo)/.test(d)) return "garment";
   if (/(button|zipper|label|trim|tag|chemical|dye|bleach)/.test(d)) return "trim";
+  if (/(fabric|cotton|polyester|linen|denim|silk|wool|knit|woven)/.test(d)) return "fabric";
   return "unknown";
 }
 

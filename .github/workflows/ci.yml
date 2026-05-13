@@ -29,7 +29,7 @@ jobs:
         run: deno lint supabase/functions/ tests/ scripts/
 
       - name: Unit tests
-        run: deno test --allow-none tests/unit/
+        run: deno test tests/unit/
 
   migration-sanity:
     name: Migration files syntax sanity
