@@ -13,3 +13,6 @@ coverage/
 web/.env.local
 web/node_modules/
 web/dist/
+
+# Deno
+deno.lock
