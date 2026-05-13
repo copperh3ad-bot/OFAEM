@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 import type { WorkflowStage, WorkflowStateRow } from "../lib/types";
@@ -30,26 +30,38 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      const { data: rows, error } = await supabase
-        .from("workflow_state")
-        .select("*")
-        .order("po_id");
-      if (error) {
-        setError(error.message);
-        setLoading(false);
-        return;
-      }
-      const all = (rows as WorkflowStateRow[]) ?? [];
-      const byStage = new Map<string, number>();
-      for (const r of all) byStage.set(r.current_stage, (byStage.get(r.current_stage) ?? 0) + 1);
-      setCounts(STAGE_ORDER.map((s) => ({ stage: s, count: byStage.get(s) ?? 0 })));
-      setReviewQueueSize(all.filter((r) => r.requires_review).length);
-      setRecentPos(all.slice(0, 10));
+  const load = useCallback(async () => {
+    const { data: rows, error } = await supabase
+      .from("workflow_state")
+      .select("*")
+      .order("po_id");
+    if (error) {
+      setError(error.message);
       setLoading(false);
-    })();
+      return;
+    }
+    const all = (rows as WorkflowStateRow[]) ?? [];
+    const byStage = new Map<string, number>();
+    for (const r of all) byStage.set(r.current_stage, (byStage.get(r.current_stage) ?? 0) + 1);
+    setCounts(STAGE_ORDER.map((s) => ({ stage: s, count: byStage.get(s) ?? 0 })));
+    setReviewQueueSize(all.filter((r) => r.requires_review).length);
+    setRecentPos(all.slice(0, 10));
+    setLoading(false);
   }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Live refresh on any change to ai_extractions / crises / proformas
+  useEffect(() => {
+    const channel = supabase
+      .channel("dashboard-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "ai_extractions" }, () => load())
+      .on("postgres_changes", { event: "*", schema: "public", table: "crisis_alerts" }, () => load())
+      .on("postgres_changes", { event: "*", schema: "public", table: "logistical_plans" }, () => load())
+      .on("postgres_changes", { event: "*", schema: "public", table: "compliance_records" }, () => load())
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [load]);
 
   if (loading) return <div className="p-8 text-slate-500">Loading dashboard…</div>;
   if (error) return <div className="p-8 text-red-600">Error: {error}</div>;

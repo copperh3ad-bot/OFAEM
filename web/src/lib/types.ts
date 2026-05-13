@@ -115,3 +115,19 @@ export interface CrisisAlert {
 
 export type UserRole =
   | "Owner" | "Manager" | "Merchandiser" | "Viewer" | "Supplier" | "QC Inspector";
+
+export interface ProformaInvoice {
+  id: string;
+  extraction_id: string;
+  po_id: string;
+  customer_id: string;
+  file_path: string;
+  checksum: string;
+  total_value: number | null;
+  total_cbm: number | null;
+  is_ready_for_invoicing: boolean;
+  signed_off_by: string | null;
+  signed_off_at: string | null;
+  generated_by: string | null;
+  generated_at: string;
+}

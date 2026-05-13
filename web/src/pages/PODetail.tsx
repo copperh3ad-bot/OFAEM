@@ -1,8 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../auth/AuthProvider";
-import type { AIExtraction, LineItem, CrisisAlert } from "../lib/types";
+import type { AIExtraction, LineItem, CrisisAlert, ProformaInvoice } from "../lib/types";
+
+const PROFORMA_BUCKET = "proforma-invoices";
+const SIGNED_URL_EXPIRY_SECONDS = 3600;
 
 function fmtCurrency(value: number, currency: string): string {
   return `${currency} ${value.toFixed(2)}`;
@@ -13,30 +16,55 @@ export default function PODetail() {
   const { user, role } = useAuth();
   const [extraction, setExtraction] = useState<AIExtraction | null>(null);
   const [crises, setCrises] = useState<CrisisAlert[]>([]);
+  const [proformas, setProformas] = useState<ProformaInvoice[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
   const [savingLine, setSavingLine] = useState<number | null>(null);
   const [signingOff, setSigningOff] = useState(false);
+  const [generatingProforma, setGeneratingProforma] = useState(false);
   const [editBuffer, setEditBuffer] = useState<Record<number, Partial<LineItem>>>({});
 
-  useEffect(() => { if (id) load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [id]);
-
-  async function load() {
-    setLoading(true); setError(null);
+  const load = useCallback(async () => {
+    if (!id) return;
+    setError(null);
     try {
-      const [extResp, crResp] = await Promise.all([
-        supabase.from("ai_extractions").select("*").eq("id", id!).maybeSingle(),
-        supabase.from("crisis_alerts").select("*").eq("extraction_id", id!).order("raised_at", { ascending: false }),
+      const [extResp, crResp, pfResp] = await Promise.all([
+        supabase.from("ai_extractions").select("*").eq("id", id).maybeSingle(),
+        supabase.from("crisis_alerts").select("*").eq("extraction_id", id).order("raised_at", { ascending: false }),
+        supabase.from("proforma_invoices").select("*").eq("extraction_id", id).order("generated_at", { ascending: false }),
       ]);
       if (extResp.error) setError(extResp.error.message);
       setExtraction(extResp.data as AIExtraction | null);
       if (!crResp.error) setCrises((crResp.data as CrisisAlert[]) ?? []);
+      if (!pfResp.error) setProformas((pfResp.data as ProformaInvoice[]) ?? []);
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
     }
-  }
+  }, [id]);
+
+  // Initial fetch
+  useEffect(() => { load(); }, [load]);
+
+  // Realtime subscription: any change to this PO's extraction, crises, or proformas → refetch
+  useEffect(() => {
+    if (!id) return;
+    const channel = supabase
+      .channel(`po-detail-${id}`)
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "ai_extractions", filter: `id=eq.${id}` },
+        () => load())
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "crisis_alerts", filter: `extraction_id=eq.${id}` },
+        () => load())
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "proforma_invoices", filter: `extraction_id=eq.${id}` },
+        () => load())
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [id, load]);
 
   function startEdit(lineNo: number, field: keyof LineItem, value: unknown) {
     setEditBuffer((b) => ({ ...b, [lineNo]: { ...b[lineNo], [field]: value } }));
@@ -45,22 +73,18 @@ export default function PODetail() {
   async function saveLine(lineNo: number) {
     if (!extraction) return;
     setSavingLine(lineNo);
+    setError(null); setInfo(null);
     try {
       const items = [...extraction.payload.line_items];
       const idx = items.findIndex((i) => i.line_no === lineNo);
       if (idx === -1) return;
       const original = items[idx];
       const patch = editBuffer[lineNo] ?? {};
-      const updated = { ...original, ...patch };
-
-      // Always clear requires_review when a human has edited the row — they've reviewed it
-      updated.requires_review = false;
-      updated.review_reason = null;
+      const updated = { ...original, ...patch, requires_review: false, review_reason: null };
 
       items[idx] = updated;
       const newPayload = { ...extraction.payload, line_items: items };
 
-      // Recompute totals + readiness from the edited items
       const totalValue = items.reduce((s, i) => s + (i.quantity * i.unit_price), 0);
       const totalCbm = items.reduce((s, i) => s + (i.cbm ?? 0), 0);
       const stillNeedsReview = items.some((i) => i.requires_review);
@@ -87,7 +111,6 @@ export default function PODetail() {
         .eq("id", extraction.id);
       if (updErr) throw new Error(updErr.message);
 
-      // Emit ml_feedback rows for every field the human actually changed
       const feedbackRows = Object.entries(patch).map(([field, newVal]) => ({
         feedback_type: "cell_edit",
         source_module: "po_extraction",
@@ -103,7 +126,7 @@ export default function PODetail() {
       if (feedbackRows.length > 0) await supabase.from("ml_feedback").insert(feedbackRows);
 
       setEditBuffer((b) => { const c = { ...b }; delete c[lineNo]; return c; });
-      await load();
+      setInfo(`Line ${lineNo} saved`);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -111,25 +134,62 @@ export default function PODetail() {
     }
   }
 
+  async function generateProforma() {
+    if (!extraction) return;
+    setGeneratingProforma(true); setError(null); setInfo(null);
+    try {
+      const { data, error: invErr } = await supabase.functions.invoke("render-proforma", {
+        body: { extraction_id: extraction.id },
+      });
+      if (invErr) throw new Error(invErr.message);
+      if (!data?.success) throw new Error(data?.error ?? "proforma generation failed");
+      setInfo(`Proforma generated — checksum ${(data.checksum as string).slice(0, 12)}…`);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setGeneratingProforma(false);
+    }
+  }
+
+  async function downloadProforma(invoice: ProformaInvoice) {
+    setError(null);
+    const { data, error: dlErr } = await supabase.storage
+      .from(PROFORMA_BUCKET)
+      .createSignedUrl(invoice.file_path, SIGNED_URL_EXPIRY_SECONDS);
+    if (dlErr) { setError(dlErr.message); return; }
+    if (data?.signedUrl) window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+  }
+
   async function signOff() {
     if (!extraction) return;
     if (!(role === "Owner" || role === "Manager")) {
-      setError("Only Owner/Manager can sign off");
+      setError("Only Owner or Manager can sign off");
       return;
     }
-    setSigningOff(true);
+    setSigningOff(true); setError(null); setInfo(null);
     try {
       const items = extraction.payload.line_items;
-      const stillNeedsReview = items.some((i) => i.requires_review);
-      if (stillNeedsReview) {
-        setError("Some line items still require review; cannot sign off.");
-        return;
+      if (items.some((i) => i.requires_review)) {
+        throw new Error("Some line items still require review — cannot sign off.");
       }
+
+      // 1) Ensure a proforma_invoices row exists for this PO. If not, render one first.
+      let invoiceId: string | null = proformas[0]?.id ?? null;
+      if (!invoiceId) {
+        const { data, error: invErr } = await supabase.functions.invoke("render-proforma", {
+          body: { extraction_id: extraction.id },
+        });
+        if (invErr) throw new Error(invErr.message);
+        if (!data?.success) throw new Error(data?.error ?? "proforma generation failed");
+        invoiceId = data.invoice_id as string;
+      }
+
+      // 2) Flip ai_extractions.is_ready_for_invoicing
       const newPayload = {
         ...extraction.payload,
         flags: { ...extraction.payload.flags, is_ready_for_invoicing: true, requires_review: false },
       };
-      const { error: e } = await supabase
+      const { error: extErr } = await supabase
         .from("ai_extractions")
         .update({
           payload: newPayload,
@@ -138,8 +198,17 @@ export default function PODetail() {
           reviewed_at: new Date().toISOString(),
         })
         .eq("id", extraction.id);
-      if (e) throw new Error(e.message);
-      await load();
+      if (extErr) throw new Error(extErr.message);
+
+      // 3) Flip proforma_invoices.is_ready_for_invoicing → Postgres trigger sets
+      //    signed_off_by + signed_off_at via auth.uid() (current_user_role check inside trigger)
+      const { error: pfErr } = await supabase
+        .from("proforma_invoices")
+        .update({ is_ready_for_invoicing: true })
+        .eq("id", invoiceId);
+      if (pfErr) throw new Error(`signoff trigger rejected: ${pfErr.message}`);
+
+      setInfo("Signed off. Proforma invoice marked ready.");
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -148,13 +217,15 @@ export default function PODetail() {
   }
 
   if (loading) return <div className="p-8 text-slate-500">Loading PO…</div>;
-  if (error && !extraction) return <div className="p-8 text-red-600">Error: {error}</div>;
   if (!extraction) return <div className="p-8 text-slate-500">Not found.</div>;
 
   const md = extraction.payload.metadata;
   const items = extraction.payload.line_items;
   const flags = extraction.payload.flags;
   const totals = extraction.payload.totals;
+  const canSignOff = role === "Owner" || role === "Manager";
+  const hasUnsavedEdits = Object.keys(editBuffer).length > 0;
+  const stillNeedsReview = items.some((i) => i.requires_review);
 
   return (
     <div className="p-8 max-w-7xl mx-auto">
@@ -180,6 +251,7 @@ export default function PODetail() {
       </header>
 
       {error && <div className="mb-4 bg-red-50 border border-red-200 text-red-800 text-sm rounded p-3">{error}</div>}
+      {info  && <div className="mb-4 bg-green-50 border border-green-200 text-green-800 text-sm rounded p-3">{info}</div>}
 
       <section className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
         <Stat label="Total value" value={fmtCurrency(totals.total_value, md.currency)} />
@@ -228,70 +300,38 @@ export default function PODetail() {
             {items.map((item, idx) => {
               const editing = editBuffer[item.line_no] ?? {};
               const isEdited = Object.keys(editing).length > 0;
-              const rowClass = item.requires_review
-                ? "bg-amber-50"
-                : isEdited ? "bg-indigo-50" : "";
+              const rowClass = item.requires_review ? "bg-amber-50" : isEdited ? "bg-indigo-50" : "";
               return (
                 <tr key={`${item.line_no}-${idx}`} className={rowClass}>
                   <td className="px-3 py-2 text-slate-500">{item.line_no}</td>
                   <td className="px-3 py-2">
-                    <input
-                      defaultValue={item.sku}
-                      onChange={(e) => startEdit(item.line_no, "sku", e.target.value)}
-                      className="w-32 rounded border-slate-300 text-xs"
-                    />
+                    <input defaultValue={item.sku} onChange={(e) => startEdit(item.line_no, "sku", e.target.value)} className="w-32 rounded border-slate-300 text-xs" />
                   </td>
                   <td className="px-3 py-2">
-                    <input
-                      defaultValue={item.description}
-                      onChange={(e) => startEdit(item.line_no, "description", e.target.value)}
-                      className="w-full rounded border-slate-300 text-xs"
-                    />
+                    <input defaultValue={item.description} onChange={(e) => startEdit(item.line_no, "description", e.target.value)} className="w-full rounded border-slate-300 text-xs" />
                   </td>
                   <td className="px-3 py-2 text-right">
-                    <input
-                      type="number"
-                      defaultValue={item.quantity}
-                      onChange={(e) => startEdit(item.line_no, "quantity", Number(e.target.value))}
-                      className="w-20 rounded border-slate-300 text-xs text-right"
-                    />
+                    <input type="number" defaultValue={item.quantity} onChange={(e) => startEdit(item.line_no, "quantity", Number(e.target.value))} className="w-20 rounded border-slate-300 text-xs text-right" />
                   </td>
                   <td className="px-3 py-2">
-                    <input
-                      defaultValue={item.unit}
-                      onChange={(e) => startEdit(item.line_no, "unit", e.target.value.toUpperCase())}
-                      className="w-20 rounded border-slate-300 text-xs uppercase"
-                    />
+                    <input defaultValue={item.unit} onChange={(e) => startEdit(item.line_no, "unit", e.target.value.toUpperCase())} className="w-20 rounded border-slate-300 text-xs uppercase" />
                   </td>
                   <td className="px-3 py-2 text-right">
-                    <input
-                      type="number"
-                      step="0.01"
-                      defaultValue={item.unit_price}
-                      onChange={(e) => startEdit(item.line_no, "unit_price", Number(e.target.value))}
-                      className="w-24 rounded border-slate-300 text-xs text-right"
-                    />
+                    <input type="number" step="0.01" defaultValue={item.unit_price} onChange={(e) => startEdit(item.line_no, "unit_price", Number(e.target.value))} className="w-24 rounded border-slate-300 text-xs text-right" />
                   </td>
                   <td className="px-3 py-2 text-right text-slate-600">{item.cbm?.toFixed(4) ?? "—"}</td>
                   <td className="px-3 py-2 text-xs">
                     {item.requires_review ? (
                       <div>
                         <span className="text-amber-700 font-medium">REVIEW</span>
-                        {item.review_reason && (
-                          <div className="text-slate-500 mt-0.5">{item.review_reason}</div>
-                        )}
+                        {item.review_reason && <div className="text-slate-500 mt-0.5">{item.review_reason}</div>}
                       </div>
-                    ) : (
-                      <span className="text-green-700">OK</span>
-                    )}
+                    ) : <span className="text-green-700">OK</span>}
                   </td>
                   <td className="px-3 py-2">
                     {isEdited && (
-                      <button
-                        onClick={() => saveLine(item.line_no)}
-                        disabled={savingLine === item.line_no}
-                        className="text-indigo-600 hover:underline text-xs disabled:opacity-50"
-                      >
+                      <button onClick={() => saveLine(item.line_no)} disabled={savingLine === item.line_no}
+                        className="text-indigo-600 hover:underline text-xs disabled:opacity-50">
                         {savingLine === item.line_no ? "Saving…" : "Save"}
                       </button>
                     )}
@@ -303,30 +343,93 @@ export default function PODetail() {
         </table>
       </section>
 
+      {/* Proforma invoices */}
+      <section className="bg-white rounded-lg shadow-sm border border-slate-200 p-5 mb-6">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h2 className="font-semibold text-slate-900">Proforma Invoices</h2>
+            <p className="text-sm text-slate-500 mt-0.5">
+              Generate the invoice document. Sign-off below marks it ready for issuance.
+            </p>
+          </div>
+          <button
+            onClick={generateProforma}
+            disabled={generatingProforma || hasUnsavedEdits || stillNeedsReview}
+            title={stillNeedsReview ? "Resolve review items first" : hasUnsavedEdits ? "Save your edits first" : ""}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-md"
+          >
+            {generatingProforma ? "Generating…" : "Generate Proforma"}
+          </button>
+        </div>
+        {proformas.length === 0 ? (
+          <div className="text-sm text-slate-500 py-3 px-1">No proforma invoices generated yet.</div>
+        ) : (
+          <ul className="divide-y divide-slate-100 text-sm">
+            {proformas.map((pf) => (
+              <li key={pf.id} className="py-3 flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="font-mono text-xs text-slate-500">
+                    {pf.checksum.slice(0, 16)}… ·{" "}
+                    {new Date(pf.generated_at).toLocaleString()}
+                  </div>
+                  <div className="text-slate-700 mt-0.5">
+                    {pf.total_value ? fmtCurrency(pf.total_value, md.currency) : "—"}
+                    {pf.total_cbm != null && ` · ${pf.total_cbm} m³`}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  {pf.is_ready_for_invoicing ? (
+                    <span className="px-2 py-0.5 bg-green-100 text-green-800 text-xs rounded">SIGNED OFF</span>
+                  ) : (
+                    <span className="px-2 py-0.5 bg-slate-100 text-slate-700 text-xs rounded">DRAFT</span>
+                  )}
+                  <button onClick={() => downloadProforma(pf)} className="text-indigo-600 hover:underline text-sm">
+                    Download HTML
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       <section className="bg-white rounded-lg shadow-sm border border-slate-200 p-5">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="font-semibold text-slate-900">Sign-off</h2>
             <p className="text-sm text-slate-500 mt-1">
-              Owner or Manager confirms this PO is ready for invoicing. Triggers Postgres role check.
+              Owner or Manager confirms this PO is ready for invoicing. Sets the
+              proforma_invoices flag; Postgres trigger captures signed_off_by /
+              signed_off_at.
             </p>
           </div>
-          <button
-            onClick={signOff}
-            disabled={
-              signingOff
-              || flags.is_ready_for_invoicing
-              || flags.requires_review
-              || !(role === "Owner" || role === "Manager")
-            }
-            className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-md"
-          >
-            {flags.is_ready_for_invoicing
+          {(() => {
+            const proformaSignedOff = proformas.some((p) => p.is_ready_for_invoicing);
+            const fullyDone = flags.is_ready_for_invoicing && proformaSignedOff;
+            const label = fullyDone
               ? "Already signed off"
               : signingOff
                 ? "Signing…"
-                : "Sign off as ready for invoicing"}
-          </button>
+                : "Sign off as ready for invoicing";
+            const disabled = signingOff || fullyDone || stillNeedsReview || !canSignOff;
+            const title = !canSignOff
+              ? "Only Owner or Manager can sign off"
+              : stillNeedsReview
+                ? "Resolve review items first"
+                : fullyDone
+                  ? "Already signed off"
+                  : "";
+            return (
+              <button
+                onClick={signOff}
+                disabled={disabled}
+                title={title}
+                className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-md"
+              >
+                {label}
+              </button>
+            );
+          })()}
         </div>
       </section>
 
