@@ -1,0 +1,12 @@
+{
+  "fixture": "pdf-simple.pdf",
+  "source_type": "PDF",
+  "file_mime": "application/pdf",
+  "po_id_contains": "FX-PDF-001",
+  "currency": "USD",
+  "payment_method": "LC",
+  "line_items_count": { "min": 4, "max": 4 },
+  "line_items_must_include_sku_substrings": ["FAB", "YRN", "GAR"],
+  "totals_total_value_within_pct": { "expected": 24495, "tolerance": 0.02 },
+  "flags": { "is_ready_for_invoicing": false }
+}

@@ -1,0 +1,13 @@
+{
+  "fixture": "xlsx-with-image.xlsx",
+  "source_type": "EXCEL",
+  "file_mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "po_id_contains": "FX-XLSX-IMG-001",
+  "currency": "USD",
+  "payment_method": "LC",
+  "line_items_count": { "min": 4, "max": 5 },
+  "line_items_must_include_sku_substrings": ["FAB", "YRN", "GAR", "TRI"],
+  "totals_total_value_within_pct": { "expected": 5452, "tolerance": 0.05 },
+  "inline_images_processed_min": 1,
+  "flags": { "is_ready_for_invoicing": false }
+}

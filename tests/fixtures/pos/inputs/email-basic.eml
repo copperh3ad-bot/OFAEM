@@ -1,0 +1,30 @@
+Content-Type: multipart/mixed; boundary="===============7521537320190893241=="
+MIME-Version: 1.0
+Subject: PO #FX-EMAIL-BASIC-001
+From: buyer@hm.com
+To: ofaem@unionfabrics.local
+Message-ID: <177869375604.39500.12134207215190045447@hm.com>
+
+--===============7521537320190893241==
+Content-Type: text/plain; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+
+Dear Supplier,
+
+Please confirm PO #FX-EMAIL-BASIC-001:
+
+Date: 2026-05-13
+Payment: LC 60 days
+Currency: USD
+Delivery: CIF Hamburg
+
+LINE ITEMS:
+1. Checkered cotton fabric 58 inches - 500 meters @ $2.50/m
+2. Cotton yarn 40s natural - 100 kg @ $7.50/kg
+3. White t-shirts adult large - 1500 pieces @ $1.80 each
+
+Best regards,
+HM Buying
+
+--===============7521537320190893241==--

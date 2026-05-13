@@ -1,0 +1,13 @@
+{
+  "fixture": "email-basic.eml",
+  "source_type": "EMAIL",
+  "po_id_contains": "FX-EMAIL-BASIC-001",
+  "currency": "USD",
+  "payment_method": "LC",
+  "line_items_count": { "min": 3, "max": 3 },
+  "line_items_must_include_sku_substrings": ["FAB", "YRN", "GAR"],
+  "line_items_must_include_units": ["METER", "KG", "PIECE"],
+  "totals_total_value_within_pct": { "expected": 4700, "tolerance": 0.02 },
+  "totals_total_cbm_min": 0.1,
+  "flags": { "is_ready_for_invoicing": false }
+}

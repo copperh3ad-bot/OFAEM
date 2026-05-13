@@ -1,0 +1,11 @@
+{
+  "fixture": "image-handwritten.png",
+  "source_type": "IMAGE",
+  "file_mime": "image/png",
+  "po_id_contains": "FX-IMG-001",
+  "currency": "USD",
+  "payment_method": "TT",
+  "line_items_count": { "min": 3, "max": 3 },
+  "line_items_must_include_sku_substrings": ["YRN", "GAR"],
+  "totals_total_value_within_pct": { "expected": 4645, "tolerance": 0.03 }
+}

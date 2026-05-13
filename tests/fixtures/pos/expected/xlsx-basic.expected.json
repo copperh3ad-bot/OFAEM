@@ -1,0 +1,12 @@
+{
+  "fixture": "xlsx-basic.xlsx",
+  "source_type": "EXCEL",
+  "file_mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "po_id_contains": "FX-XLSX-001",
+  "currency": "USD",
+  "payment_method": "TT",
+  "line_items_count": { "min": 3, "max": 3 },
+  "line_items_must_include_sku_substrings": ["FAB", "YRN", "GAR"],
+  "totals_total_value_within_pct": { "expected": 9450, "tolerance": 0.02 },
+  "flags": { "is_ready_for_invoicing": false }
+}

@@ -1,0 +1,13 @@
+{
+  "fixture": "email-with-image.eml",
+  "source_type": "EMAIL",
+  "raw_email": true,
+  "po_id_contains": "FX-EMAIL-IMG-001",
+  "currency": "USD",
+  "payment_method": "TT",
+  "line_items_count": { "min": 4, "max": 5 },
+  "line_items_must_include_sku_substrings": ["FAB", "YRN", "GAR", "TRI"],
+  "totals_total_value_within_pct": { "expected": 5190, "tolerance": 0.03 },
+  "inline_images_processed_min": 1,
+  "flags": { "is_ready_for_invoicing": false }
+}
