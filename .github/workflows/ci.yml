@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint + unit tests (Deno)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+
+      - name: Cache Deno deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/deno
+          key: ${{ runner.os }}-deno-${{ hashFiles('deno.json', 'supabase/functions/**/*.ts', 'tests/**/*.ts') }}
+
+      - name: Format check
+        run: deno fmt --check supabase/functions/ tests/ scripts/
+
+      - name: Lint
+        run: deno lint supabase/functions/ tests/ scripts/
+
+      - name: Unit tests
+        run: deno test --allow-none tests/unit/
+
+  migration-sanity:
+    name: Migration files syntax sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Postgres
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client
+
+      - name: Boot ephemeral Postgres in Docker
+        run: |
+          docker run -d --rm --name pg \
+            -e POSTGRES_PASSWORD=ci \
+            -p 5432:5432 \
+            postgres:17
+          # wait for ready
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 && break
+            sleep 1
+          done
+
+      - name: Apply migrations in order
+        env:
+          PGPASSWORD: ci
+        run: |
+          # Bootstrap auth.users so foreign keys in migrations succeed
+          psql -h localhost -U postgres -c "CREATE SCHEMA IF NOT EXISTS auth;"
+          psql -h localhost -U postgres -c "CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY DEFAULT gen_random_uuid());"
+          psql -h localhost -U postgres -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+          # Stub auth.uid() so policies can be created
+          psql -h localhost -U postgres -c "CREATE OR REPLACE FUNCTION auth.uid() RETURNS UUID LANGUAGE SQL STABLE AS \$\$ SELECT NULL::uuid \$\$;"
+          # Run migrations
+          for f in supabase/migrations/*.sql; do
+            echo "Applying $f"
+            psql -h localhost -U postgres -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Stop Postgres
+        if: always()
+        run: docker stop pg || true
