@@ -1,0 +1,22 @@
+Content-Type: multipart/mixed; boundary="===============5084719068093739093=="
+MIME-Version: 1.0
+Subject: =?utf-8?q?Invoice_=23INV-2026-115_=E2=80=94_payment_reminder?=
+From: ar@unionfabrics.com
+To: orders@unionfabrics.local
+Message-ID: <177869506253.41730.3078062670019531021@unionfabrics.com>
+
+--===============5084719068093739093==
+Content-Type: text/plain; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+
+Dear Accounts,
+
+Please settle invoice #INV-2026-115, USD 12,800, due 2026-05-10. The
+underlying PO HM-2026-9001 already shipped.
+
+Wire details unchanged.
+
+Union Fabrics AR
+
+--===============5084719068093739093==--

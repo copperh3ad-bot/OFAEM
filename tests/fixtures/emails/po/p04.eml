@@ -1,0 +1,26 @@
+Content-Type: multipart/mixed; boundary="===============6274389167215790614=="
+MIME-Version: 1.0
+Subject: Confirmed: PO 99887766
+From: ops@uniqlo.com
+To: orders@unionfabrics.local
+Message-ID: <177869506253.41730.10957137491092666788@uniqlo.com>
+
+--===============6274389167215790614==
+Content-Type: text/plain; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+
+Confirming PO 99887766.
+
+Buyer: Uniqlo Japan KK
+Currency: JPY
+Payment: LC at sight
+Incoterms: CIF Yokohama
+Ship-by: 2026-08-15
+
+3000 pcs T-shirt round neck white adult large @ JPY 480
+1500 pcs Polo shirt navy adult medium @ JPY 950
+
+Confirm receipt.
+
+--===============6274389167215790614==--
