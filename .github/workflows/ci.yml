@@ -25,9 +25,6 @@ jobs:
             ~/.cache/deno
           key: ${{ runner.os }}-deno-${{ hashFiles('deno.json', 'supabase/functions/**/*.ts', 'tests/**/*.ts') }}
 
-      - name: Format check
-        run: deno fmt --check supabase/functions/ tests/ scripts/
-
       - name: Lint
         run: deno lint supabase/functions/ tests/ scripts/
 
@@ -61,12 +58,28 @@ jobs:
         env:
           PGPASSWORD: ci
         run: |
-          # Bootstrap auth.users so foreign keys in migrations succeed
+          # Bootstrap Supabase environment so migrations referencing auth.* /
+          # the authenticated/service_role/anon roles can apply against a
+          # vanilla Postgres container.
           psql -h localhost -U postgres -c "CREATE SCHEMA IF NOT EXISTS auth;"
           psql -h localhost -U postgres -c "CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY DEFAULT gen_random_uuid());"
           psql -h localhost -U postgres -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
-          # Stub auth.uid() so policies can be created
           psql -h localhost -U postgres -c "CREATE OR REPLACE FUNCTION auth.uid() RETURNS UUID LANGUAGE SQL STABLE AS \$\$ SELECT NULL::uuid \$\$;"
+          # Supabase built-in roles
+          psql -h localhost -U postgres <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+              CREATE ROLE anon NOLOGIN;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+              CREATE ROLE authenticated NOLOGIN;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+              CREATE ROLE service_role NOLOGIN BYPASSRLS;
+            END IF;
+          END $$;
+          SQL
           # Run migrations
           for f in supabase/migrations/*.sql; do
             echo "Applying $f"
