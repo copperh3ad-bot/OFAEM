@@ -101,8 +101,6 @@ serve(async (req: Request): Promise<Response> => {
   let crisis: unknown = null;
   if (!computedPassed) {
     const severity = severityForDefectRate(body.defect_rate_percentage);
-    // deno-lint-ignore no-explicit-any
-    const payload = ext.payload as any;
     const { data: crisisRow } = await supabase
       .from("crisis_alerts")
       .insert({
